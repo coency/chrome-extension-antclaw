@@ -1,5 +1,5 @@
 // content.js —— 统一多平台创作者数据中心提取
-// 运行在已登录的：抖音创作者中心(creator.douyin.com) / 微信视频号助手(channels.weixin.qq.com)
+// 运行在已登录的抖音 / 微信视频号 / B 站创作者页面；B 站逻辑见 bilibili.js。
 const pad2 = (n) => String(n).padStart(2, '0');
 // YYYYMMDD -> YYYY.MM.DD（用于周度显示具体日期范围）
 function fmtRange(yyyymmdd) { const s = String(yyyymmdd); return s.slice(0, 4) + '.' + s.slice(4, 6) + '.' + s.slice(6, 8); }
@@ -244,8 +244,8 @@ async function douyinExtract(period, concurrency) {
       const id = videoId(it);
       let maxSrc = '', kw = '';
       // 补充接口失败不能静默：累计失败篇数，并把登录失效单独识别出来（旧实现 catch{} 让整列变空却无提示）
-      try { const s = await axhr('https://creator.douyin.com/janus/douyin/creator/data/item/play/source?aid=2906&item_id=' + id); const arr = Array.isArray(s.play_source) ? s.play_source : []; if (arr.length) { arr.sort((a, b) => (Number(b.value) || 0) - (Number(a.value) || 0)); maxSrc = srcName(arr[0].key); } } catch (e) { srcFail++; if (/登录已失效/.test(String((e && e.message) || e))) extraLogin = true; }
-      try { const k = await axhr('https://creator.douyin.com/janus/douyin/creator/data/item_analysis/search/keyword?aid=2906&id=' + id); const kwArr = ((Array.isArray(k.inspire_search) ? k.inspire_search : []).concat(Array.isArray(k.show_from) ? k.show_from : [])).map((x) => (typeof x === 'string') ? x : (x && (x.keyword || x.word || x.content || x.search_word || x.name)) || ''); kw = kwArr.filter(Boolean).join(', ') || '暂无数据'; } catch (e) { kw = ''; kwFail++; if (/登录已失效/.test(String((e && e.message) || e))) extraLogin = true; }
+      try { const s = await axhr('https://creator.douyin.com/janus/douyin/creator/data/item/play/source?aid=2906&item_id=' + id); assertLogin(s); const arr = Array.isArray(s.play_source) ? s.play_source : []; if (arr.length) { arr.sort((a, b) => (Number(b.value) || 0) - (Number(a.value) || 0)); maxSrc = srcName(arr[0].key); } } catch (e) { srcFail++; if (/登录已失效/.test(String((e && e.message) || e))) extraLogin = true; }
+      try { const k = await axhr('https://creator.douyin.com/janus/douyin/creator/data/item_analysis/search/keyword?aid=2906&id=' + id); assertLogin(k); const kwArr = ((Array.isArray(k.inspire_search) ? k.inspire_search : []).concat(Array.isArray(k.show_from) ? k.show_from : [])).map((x) => (typeof x === 'string') ? x : (x && (x.keyword || x.word || x.content || x.search_word || x.name)) || ''); kw = kwArr.filter(Boolean).join(', ') || '暂无数据'; } catch (e) { kw = ''; kwFail++; if (/登录已失效/.test(String((e && e.message) || e))) extraLogin = true; }
       const p = { publish: cDateTimeS(cur.create_time), duration: aw && aw.duration != null ? Math.floor(aw.duration / 1000) : '', title: (cur.description || '').replace(/\s+/g, ' ').slice(0, 200), plays: m.view_count, digg: m.like_count, comment: m.comment_count, share: m.share_count, collect: m.favorite_count, danmaku: m.danmaku_count, finish: pct(m.completion_rate), f5: pct(m.completion_rate_5s), bounce2s: pct(m.bounce_rate_2s), avgPlay: m.avg_view_second != null ? String(Math.round(Number(m.avg_view_second) * 100) / 100) : '', absorb: m.subscribe_count, forfeit: m.unsubscribe_count, fanShare: pct(m.fan_view_proportion), maxSrc, kw, coverUrl: coverOf(cur), coverFileName: coverFile(it, i) };
       return p;
     });
@@ -263,36 +263,34 @@ async function douyinExtract(period, concurrency) {
   return { platform: '抖音', scopeLabel, periodName: R.label, period: R.label, rangeText: fmtRange(R.startD) + '-' + fmtRange(R.endD), summaryCsv, postCsv, posts, coverFolder: R.label + '_' + scopeLabel + '作品封面', count: posts.length, warning: warnNotes.concat(notes).join('；') };
 }
 
-// 提取完成通知（通知后台弹系统通知；弹窗若开着监听 extractDone 以恢复界面）。
-function broadcastDone() {
-  try { chrome.runtime.sendMessage({ type: 'extractDone' }).catch(() => {}); } catch (e) {}
-}
-
+// 页面内同步拦截重复消息；后台负责跨标签页互斥、冷却及结果持久化。
+let extractionActive = false;
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === 'extract') {
-    const platform = msg.platform || '抖音'; // 与弹窗默认选中项保持一致（弹窗总会显式传 platform，此处仅兜底）
+    const platform = msg.platform || '抖音';
     const period = msg.period || 'month';
-    try { chrome.storage.local.set({ running: true, runningAt: Date.now() }).catch(() => {}); } catch (e) {}
-    const finish = async (d) => {
-      // 先把 running:false 与结果、按平台完成时间写入 storage，确保落库后再发完成消息/回包，
-      // 避免弹窗在 extractDone/响应里读到旧的 running:true 而退回「提取中」。
+    if (!['抖音', '视频号', '哔哩哔哩'].includes(platform)) {
+      sendResponse({ ok: false, error: '小红书暂未接入' }); return;
+    }
+    if (extractionActive) { sendResponse({ ok: false, busy: true, error: '已有提取任务正在运行，请等待完成' }); return; }
+    extractionActive = true;
+    (async () => {
       try {
-        const v = await chrome.storage.local.get(['lastResultAtMap']);
-        const map = Object.assign({}, (v && v.lastResultAtMap) || {});
-        map[d.platform] = Date.now();
-        await chrome.storage.local.set({ running: false, lastResult: d, lastResultAtMap: map });
-      } catch (e) {
-        // 落库失败（如结果超出 storage.local 配额）不能被静默吞掉：回包照旧，但必须提示用户尽快下载，
-        // 否则重新打开弹窗会既看不到结果、又停在「提取中」。
-        d.warning = [d.warning, '结果写入本地存储失败（' + String((e && e.message) || e) + '），关闭弹窗后可能无法恢复本次结果，请尽快下载'].filter(Boolean).join('；');
-      }
-      broadcastDone();
-      sendResponse({ ok: true, data: d });
-    };
-    const fail = (e) => { try { chrome.storage.local.set({ running: false }).catch(() => {}); } catch (e2) {} sendResponse({ ok: false, error: String((e && e.message) || e) }); };
-    if (platform === '视频号') { channelsExtract(period).then(finish).catch(fail); return true; }
-    if (platform === '抖音') { douyinExtract(period, msg.concurrency).then(finish).catch(fail); return true; }
-    sendResponse({ ok: false, error: '小红书 / 哔哩哔哩 暂未接入' }); return;
+        const started = await chrome.runtime.sendMessage({ type: 'beginExtraction', platform, period });
+        if (!started || !started.ok) { sendResponse(started || { ok: false, error: '无法启动提取任务' }); return; }
+        let outcome;
+        try {
+          const data = platform === '视频号' ? await channelsExtract(period)
+            : platform === '哔哩哔哩' ? await bilibiliExtract(period)
+            : await douyinExtract(period, msg.concurrency);
+          outcome = { data };
+        } catch (e) { outcome = { error: String((e && e.message) || e) }; }
+        const result = await chrome.runtime.sendMessage({ type: 'endExtraction', taskId: started.taskId, ...outcome });
+        sendResponse(result || { ok: false, error: '无法保存提取结果，请重新打开扩展检查状态' });
+      } catch (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); }
+      finally { extractionActive = false; }
+    })();
+    return true;
   }
   if (msg && msg.type === 'ping') { sendResponse({ ok: true }); return; }
 });

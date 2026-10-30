@@ -26,7 +26,7 @@
     <option value="抖音">抖音</option>
     <option value="视频号">视频号</option>
     <option value="小红书" disabled>小红书（暂未接入）</option>
-    <option value="哔哩哔哩" disabled>哔哩哔哩（暂未接入）</option>
+    <option value="哔哩哔哩">哔哩哔哩</option>
   </select></div>
   <div class="step"><b>周期</b><select id="period">
     <option value="month">上一个月（自然月）</option>
@@ -40,8 +40,10 @@
   </div>
   <div id="status"></div>
   <div id="result"></div>
-  <div class="dim">需先在一个已登录对应平台的页面上使用。先「提取数据」，成功后下载按钮才可点。小红书/哔哩哔哩暂未接入。</div>
+  <div class="row"><button id="biliSample">导出9月29日分析样本</button></div>
+  <div class="dim">需先在已登录的平台页面使用。B站作品明细为所选周期发布作品的累计数据。小红书暂未接入。</div>
   <div class="dim">遇到问题或想改进？加 QQ 交流群：1107628766</div>
   <script src="popup.js"></script>
+  <script src="popup-sample.js"></script>
 </body>
 </html>

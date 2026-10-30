@@ -7,36 +7,44 @@ const LOGIN_URL = {
   '视频号': 'https://channels.weixin.qq.com',
   '抖音': 'https://creator.douyin.com',
   '小红书': 'https://creator.xiaohongshu.com',
-  '哔哩哔哩': 'https://member.bilibili.com/platform/home',
+  '哔哩哔哩': 'https://member.bilibili.com/platform/data-up/video/',
 };
 let latest = null;
-let successHandled = false; // 本次弹窗会话是否已成功处理过提取结果，避免 extractDone 覆盖「完成 ✓」
-let userActed = false; // 用户是否已点过「提取数据」：避免 restore() 的异步回调覆盖刚更新的界面
+let extracting = false;
+let requestPending = false; // 本弹窗发起的请求由回包处理，重新打开的弹窗由广播恢复。
+let stateVersion = 0; // 使旧的异步恢复/冷却查询失效，避免覆盖新任务的界面。
+function isRunning(v) { return v && v.running && v.runningAt && Date.now() - v.runningAt < RUNNING_STALE_MS; }
+function setRunning(value) {
+  extracting = value;
+  $('platform').disabled = value; $('period').disabled = value;
+  if (value) { clearCooldown(); setExtractBtn(false); setBtns(false); $('result').textContent = ''; setStatus('提取中…' + HINT); }
+}
 function restore() {
-  chrome.storage.local.get(['running', 'runningAt', 'lastResult']).then((v) => {
-    if (userActed) return; // 用户已经点过提取，别用存储里的旧状态覆盖当前界面
-    if (v && v.running) {
-      const stale = !v.runningAt || (Date.now() - v.runningAt) > RUNNING_STALE_MS;
-      if (stale) { // 陈旧（提取页已关/内容脚本崩）：直接重置，避免永久「提取中」
-        chrome.storage.local.set({ running: false }).catch(() => {});
-        setExtractBtn(true); clearCooldown(); setBtns(false); $('result').textContent = ''; setStatus('');
-        return;
-      }
-      setStatus('提取中…' + HINT); setBtns(false); setExtractBtn(false); return;
+  if (requestPending) return;
+  const version = ++stateVersion;
+  chrome.storage.local.get(['running', 'runningAt', 'lastResult', 'lastError']).then((v) => {
+    if (requestPending || version !== stateVersion) return;
+    setRunning(!!isRunning(v));
+    if (extracting) return;
+    if (v && v.lastError) {
+      latest = v.lastResult || null;
+      $('platform').value = v.lastError.platform;
+      $('period').value = v.lastError.period || 'month';
+      setBtns(false); $('result').textContent = ''; refreshBtnState(); return;
     }
     if (v && v.lastResult) { latest = v.lastResult; syncSelectsToLatest(); applySelectionState(); }
-    else { setExtractBtn(true); clearCooldown(); setBtns(false); $('result').textContent = ''; setStatus(''); }
-  }).catch(() => {});
+    else { setBtns(false); $('result').textContent = ''; setStatus(''); refreshBtnState(); }
+  }).catch((e) => { if (version === stateVersion && !requestPending) setStatus('无法恢复提取状态：' + e.message, true); });
 }
-// 接收内容脚本的完成通知（结果已写入 storage，这里恢复界面）
+// 接收后台的完成/失败通知（状态已写入 storage，这里恢复界面）。
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg && msg.type === 'extractDone' && !successHandled) { restore(); } // 结果已存入 storage，恢复并启用按钮（已处理则不再覆盖）
+  if (msg && ['extractDone', 'extractFailed'].includes(msg.type)) { restore(); }
 });
 restore(); // 打开弹窗时恢复上次成功结果，避免下载按钮一直灰色
 function activeTab() { return new Promise((r) => chrome.tabs.query({ active: true, currentWindow: true }, (t) => r(t[0]))); }
 // 判断某 URL 是否属于所选平台
 function urlMatches(url, platform) {
-  const hosts = platform === '视频号' ? ['channels.weixin.qq.com'] : platform === '抖音' ? ['creator.douyin.com'] : [];
+  const hosts = platform === '视频号' ? ['channels.weixin.qq.com'] : platform === '抖音' ? ['creator.douyin.com'] : platform === '哔哩哔哩' ? ['member.bilibili.com'] : [];
   try { const h = new URL(url).hostname; return hosts.some((d) => h === d || h.endsWith('.' + d)); } catch (e) { return false; }
 }
 function sendToTab(tabId, msg) { return new Promise((res, rej) => { chrome.tabs.sendMessage(tabId, msg, (r) => { if (chrome.runtime.lastError) rej(new Error(chrome.runtime.lastError.message)); else res(r); }); }); }
@@ -67,16 +75,22 @@ function $(id) { return document.getElementById(id); }
 $('platform').addEventListener('change', () => { applySelectionState(); });
 $('period').addEventListener('change', () => { applySelectionState(); });
 function setStatus(s, isErr) { const el = $('status'); el.textContent = s; el.className = isErr ? 'err' : ''; }
-function setBtns(enable) { $('csv').disabled = !enable; $('postCsv').disabled = !enable; $('zipCover').disabled = !enable; }
-function setExtractBtn(enable) { $('extract').disabled = !enable; }
+function setBtns(enable) {
+  const posts = latest && Array.isArray(latest.posts) ? latest.posts : [];
+  $('csv').disabled = !(enable && latest && latest.summaryCsv);
+  $('postCsv').disabled = !(enable && latest && latest.postCsv && posts.length);
+  $('zipCover').disabled = !(enable && posts.some((p) => p.coverUrl && p.coverFileName));
+}
+function setExtractBtn(enable) { $('extract').disabled = !enable || extracting || requestPending; }
 // 把平台/周期下拉框同步成当前数据（latest）对应的值，便于辨认该数据属于哪个平台/周期。
 function syncSelectsToLatest() {
   if (!latest) return;
-  if ($('platform') && ['视频号', '抖音'].includes(latest.platform)) $('platform').value = latest.platform;
+  if ($('platform') && ['视频号', '抖音', '哔哩哔哩'].includes(latest.platform)) $('platform').value = latest.platform;
   if ($('period')) $('period').value = latest.scopeLabel === '周度' ? 'week' : 'month';
 }
 // 结果摘要与提示都跟随「当前所选平台+周期」：与已加载数据一致则显示并启用下载，不一致则清空（避免切换后仍显示旧平台/周期的数据与提示）。
 function applySelectionState() {
+  if (extracting || requestPending) return;
   if (!latest) { setBtns(false); $('result').textContent = ''; setStatus(''); refreshBtnState(); return; }
   const plat = $('platform').value, period = $('period').value;
   const latestPeriod = latest.scopeLabel === '周度' ? 'week' : 'month';
@@ -86,7 +100,8 @@ function applySelectionState() {
 }
 function render(d) {
   let t = '平台: ' + d.platform + ' · 周期: ' + d.period + ' （' + (d.rangeText || d.scopeLabel) + '）\n';
-  t += '单篇作品: ' + d.count + ' 条；可下载汇总/单篇CSV、封面ZIP\n';
+  t += '单篇作品: ' + d.count + ' 条\n';
+  if (d.dataNote) t += d.dataNote + '\n';
   if (d.warning) t += '⚠ ' + d.warning + '\n';
   $('result').textContent = t;
 }
@@ -152,33 +167,48 @@ function startCooldown(seconds, doneMsg) {
 }
 // 按当前所选平台单独判断是否在 60 秒冷却内；冷却按平台独立计算。
 function refreshBtnState(doneMsg) {
+  if (extracting || requestPending) return;
+  const version = ++stateVersion;
   const platform = $('platform').value;
-  chrome.storage.local.get(['lastResultAtMap']).then((v) => {
+  chrome.storage.local.get(['running', 'runningAt', 'lastResultAtMap', 'lastError']).then((v) => {
+    if (version !== stateVersion || extracting || requestPending || platform !== $('platform').value) return;
+    if (isRunning(v)) { setRunning(true); return; }
     const map = (v && v.lastResultAtMap) || {};
     const at = map[platform] || 0;
-    const remain = COOLDOWN_S - Math.floor((Date.now() - at) / 1000);
-    if (remain > 0) startCooldown(remain, doneMsg);
-    else { setExtractBtn(true); clearCooldown(); if (doneMsg) setStatus(doneMsg); }
-  }).catch(() => { setExtractBtn(true); clearCooldown(); });
+    const error = v && v.lastError && v.lastError.platform === platform ? v.lastError : null;
+    const remain = Math.ceil((Math.max(at + COOLDOWN_S * 1000, error ? error.at + FAIL_COOLDOWN_S * 1000 : 0) - Date.now()) / 1000);
+    if (remain > 0) startCooldown(remain);
+    else { setExtractBtn(true); clearCooldown(); }
+    if (error) setStatus('提取失败！' + error.message, true);
+    else if (doneMsg) setStatus(doneMsg);
+  }).catch((e) => {
+    if (version !== stateVersion || extracting || requestPending) return;
+    setExtractBtn(true); clearCooldown(); setStatus('无法读取提取状态：' + e.message, true);
+  });
 }
 async function doExtract() {
-  userActed = true;
-  setStatus('提取中…' + HINT); $('result').textContent = ''; setBtns(false); setExtractBtn(false); clearCooldown(); successHandled = false;
+  if (extracting || requestPending || $('extract').disabled) return;
+  ++stateVersion;
+  requestPending = true; setRunning(true);
   try {
     const platform = $('platform').value, period = $('period').value;
     const tab = await activeTab();
-    if (!tab || !tab.url || !urlMatches(tab.url, platform)) { setBtns(false); setExtractBtn(true); clearCooldown(); setStatus('请先打开并登录「' + platform + '」：' + (LOGIN_URL[platform] || '')); return; }
+    if (!tab || !tab.url || !urlMatches(tab.url, platform)) { requestPending = false; setRunning(false); setBtns(false); setExtractBtn(true); clearCooldown(); setStatus('请先打开并登录「' + platform + '」：' + (LOGIN_URL[platform] || '')); return; }
     const r = await sendToTabRetry(tab.id, { type: 'extract', platform, period, concurrency: 4 });
+    requestPending = false; setRunning(false);
+    if (r && r.busy) { restore(); return; }
+    if (r && r.cooldown) { setStatus(r.error, true); startCooldown(r.cooldown); return; }
     if (!r || !r.ok) throw new Error((r && r.error) || '无响应');
-    latest = r.data; render(latest); syncSelectsToLatest(); setBtns(true); startCooldown(COOLDOWN_S, '完成 ✓ 可点击上方「下载」保存'); successHandled = true;
+    latest = r.data; render(latest); syncSelectsToLatest(); setBtns(true); startCooldown(COOLDOWN_S, '完成 ✓ 可点击上方「下载」保存');
   } catch (e) {
+    requestPending = false; setRunning(false);
     setBtns(false); clearCooldown(); setStatus('提取失败！' + e.message, true);
     startCooldown(FAIL_COOLDOWN_S); // 失败也给短冷却：不能因为"失败"就绕过连点约束
   }
 }
 $('extract').addEventListener('click', doExtract);
 // 注意：不因切换平台/周期而清空 60 秒冷却，避免绕过风控；冷却由 startCooldown 统一管理。
-$('csv').addEventListener('click', async () => { if (!latest) { setStatus('请先「提取数据」', true); return; } const ok = await download(latest.platform + '_' + latest.periodName + '_' + latest.scopeLabel + '汇总数据统计.csv', '\uFEFF' + latest.summaryCsv, 'text/csv'); if (ok) setStatus('已发起下载汇总CSV'); });
+$('csv').addEventListener('click', async () => { if (!latest || !latest.summaryCsv) { setStatus('请先「提取数据」或本次汇总数据不可用', true); return; } const ok = await download(latest.platform + '_' + latest.periodName + '_' + latest.scopeLabel + '汇总数据统计.csv', '\uFEFF' + latest.summaryCsv, 'text/csv'); if (ok) setStatus('已发起下载汇总CSV'); });
 $('postCsv').addEventListener('click', async () => { if (!latest || !latest.posts || !latest.posts.length) { setStatus('请先「提取数据」或本期无作品', true); return; } const ok = await download(latest.platform + '_' + latest.periodName + '_' + latest.scopeLabel + '作品数据统计.csv', '\uFEFF' + latest.postCsv, 'text/csv'); if (ok) setStatus('已发起下载单篇CSV'); });
 $('zipCover').addEventListener('click', async () => {
   if (!latest || !latest.posts || !latest.posts.length) { setStatus('请先「提取数据」或无封面', true); return; }

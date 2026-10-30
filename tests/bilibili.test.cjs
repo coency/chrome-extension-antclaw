@@ -430,9 +430,13 @@ test('基础汇总失败时仍可导出独立取得的访客数据', async () =>
   assert.deepEqual(row.slice(11), ['60']);
 });
 
-test('扩展汇总登录失效后不继续请求作品', async () => {
+test('扩展汇总登录失效时保留基础汇总，不继续请求作品', async () => {
   const app = setup({ extraGraphResponse: () => ({ code: -101 }) });
-  await assert.rejects(app.extract(), /登录已失效/);
+  const result = await app.extract();
+  assert.match(result.summaryCsv, /465,465,465,465,465,465,465,-30,/);
+  assert.equal(result.postCsv, '');
+  assert.equal(result.count, 0);
+  assert.match(result.warning, /登录已失效/);
   assert.equal(app.calls.length, 2);
 });
 
@@ -595,4 +599,59 @@ test('进度接口登录失效停止排队查询及后续对比请求', async ()
   assert.equal(app.calls.some((c) => c.url.includes('/archive_diagnose/compare')), false);
   assert.ok(result.posts.every((p) => p.avgPlayProgress === '' && p.playProgressRatio === '' && p.plays === 24));
   assert.match(result.warning, /进度查询期间登录失效/);
+});
+
+
+test('B 站分页中途登录失效保留汇总与已取得作品，停止所有后续补充请求', async () => {
+  const messages = [];
+  const app = setup({
+    pageResponse: (page) => page === 1 ? { code: 0, data: { list: [item(1)], pager: { pn: 1, total: 2 } } } : { code: -101 },
+    sendMessage: async (message) => { messages.push(message); return message.type === 'beginExtraction'
+      ? { ok: true, taskId: 'test' } : { ok: !message.error, data: message.data, error: message.error }; },
+  });
+  const response = await app.send({ type: 'extract', platform: '哔哩哔哩', period: 'month' });
+  assert.equal(response.ok, true);
+  const result = response.data;
+  assert.equal(result.count, 1);
+  assert.match(result.summaryCsv, /465,465/);
+  assert.equal(result.posts[0].plays, 24);
+  const row = result.postCsv.trimEnd().split('\n')[1].split(',');
+  assert.equal(row.length, 19);
+  assert.deepEqual(row.slice(7), Array(12).fill(''));
+  assert.match(result.warning, /列表可能不完整.*登录已失效/);
+  assert.equal(app.calls.length, 4);
+  const completed = messages.find((message) => message.type === 'endExtraction');
+  assert.equal(completed.data.count, 1);
+  assert.equal(completed.error, undefined);
+});
+
+test('B 站汇总不可用但分页已成功时，登录失效仍可导出已取得作品', async () => {
+  const app = setup({ graph: { code: -400 }, ...unavailableExtras,
+    pageResponse: (page) => page === 1 ? { code: 0, data: { list: [item(1)], pager: { pn: 1, total: 2 } } } : { code: -101 },
+  });
+  const result = await app.extract();
+  assert.equal(result.summaryCsv, '');
+  assert.equal(result.count, 1);
+  assert.match(result.postCsv, /作品1/);
+  assert.match(result.warning, /登录已失效/);
+  assert.equal(app.calls.length, 4);
+});
+
+test('B 站首个作品请求登录失效时，仍可导出有效汇总', async () => {
+  const app = setup({ pageResponse: () => ({ code: -101 }) });
+  const result = await app.extract();
+  assert.notEqual(result.summaryCsv, '');
+  assert.equal(result.postCsv, '');
+  assert.equal(result.count, 0);
+  assert.match(result.warning, /登录已失效/);
+  assert.equal(app.calls.length, 3);
+});
+
+test('B 站登录失效且没有取得有效汇总或列表时仍报告失败', async () => {
+  for (const options of [
+    { graph: { code: -400 }, extraGraphResponse: () => ({ code: -101 }) },
+    { graph: { code: -400 }, ...unavailableExtras, pageResponse: () => ({ code: -101 }) },
+  ]) {
+    await assert.rejects(setup(options).extract(), /登录已失效/);
+  }
 });

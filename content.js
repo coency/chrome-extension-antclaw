@@ -13,8 +13,22 @@ function weekInfo() { const n = new Date(); const dow = n.getDay(); const diff =
 function cDate(sec) { const d = new Date(sec * 1000); return '' + d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()); }
 function cDateTimeS(sec) { const d = new Date(sec * 1000); return '' + d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds()); }
 function cDateYmd(sec) { const d = new Date(sec * 1000); return '' + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()); }
-// 数组类型保护：接口结构变化时（数字/对象）不能直接 .reduce，否则抛出不可读的 TypeError
-function sum(a) { return (Array.isArray(a) ? a : []).reduce((x, y) => x + (parseInt(y, 10) || 0), 0); }
+// 视频号数值必须可验证；缺失/异常与真实零值分开，不把部分有效数据冒充完整合计。
+function channelsNumber(raw, { integer = false, allowNegative = false } = {}) {
+  if (typeof raw !== 'number' && (typeof raw !== 'string' || !/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(raw.trim()))) return '';
+  const value = Number(raw);
+  return Number.isFinite(value) && Math.abs(value) <= Number.MAX_SAFE_INTEGER && (allowNegative || value >= 0) && (!integer || Number.isSafeInteger(value)) ? value : '';
+}
+function channelsSum(series, { allowNegative = false } = {}) {
+  if (!Array.isArray(series) || !series.length) return '';
+  let total = 0;
+  for (const raw of series) {
+    const value = channelsNumber(raw, { integer: true, allowNegative });
+    if (value === '' || !Number.isSafeInteger(total + value)) return '';
+    total += value;
+  }
+  return total;
+}
 function last(a) { return Array.isArray(a) ? a[a.length - 1] : undefined; }
 // 全文件唯一的百分比格式化：null / undefined / '' 输出空串，其余按 0-1 小数 ×100 保留 2 位
 function pct(x) { return (x == null || x === '') ? '' : (Number(x) * 100).toFixed(2) + '%'; }
@@ -30,15 +44,18 @@ async function axhr(url, opt) {
   // 网络错误/超时重试；HTTP 错误（401/403/500）不再重试并给出明确提示；JSON 解析失败才重试。
   // 注意：此处不要引入名为 last 的变量，会遮蔽上面的全局工具函数 last()。
   for (let k = 0; k < 3; k++) {
-    let r, ctl, timer;
+    let r;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), REQ_TIMEOUT_MS);
     try {
-      ctl = new AbortController();
-      timer = setTimeout(() => ctl.abort(), REQ_TIMEOUT_MS);
       r = await fetch(url, Object.assign({ credentials: 'include' }, opt, { signal: ctl.signal }));
-    } catch (e) { clearTimeout(timer); await sleep(900); continue; }
-    clearTimeout(timer);
-    if (!r.ok) throw new Error('请求失败（HTTP ' + r.status + '）：请确认已登录对应平台后再操作');
-    try { return await r.json(); } catch (e) { await sleep(900); }
+      // 必须 await 正文读取；fetch 在响应头到达时就会返回，此时仍可能超时。
+      if (r.ok) return await r.json();
+    } catch (e) {
+      // 网络错误、正文读取超时或 JSON 解析失败，按相同的有限次数重试。
+    } finally { clearTimeout(timer); }
+    if (r && !r.ok) throw new Error('请求失败（HTTP ' + r.status + '）：请确认已登录对应平台后再操作');
+    if (k < 2) await sleep(900);
   }
   throw new Error('请求失败：请确认已登录对应平台后再操作（若已登录请刷新页面重试）');
 }
@@ -106,29 +123,25 @@ async function channelsExtract(period) {
     if (post.errCode === 300800) throw new Error('视频号汇总请求被平台拒绝（错误码300800：' + (post.errMsg || '') + '）：请刷新页面后重试；若持续出现，请把控制台 [AntClaw] 那行（含请求区间）发给我们');
     throw new Error('视频号数据获取失败！错误码' + post.errCode + '：' + (post.errMsg || '') );
   }
-  const METRICS = ['browse', 'like', 'fav', 'comment', 'forward', 'follow'];
-  // tabs 可能因接口结构变化不是数组；data[m] 也可能不是数组（历史上是数字数组）——统一做类型保护，
-  // 否则 sum() 内部的 reduce 会抛出 "a.reduce is not a function" 这类不可读错误。
+  const METRICS = [['browse', '播放量'], ['like', '朋友量'], ['fav', '点赞量'], ['comment', '评论量'], ['forward', '分享量']];
   const tabs = Array.isArray(post.data && post.data.dataByTabtype) ? post.data.dataByTabtype : [];
-  // 各渠道分解（浏览来源等）：仅用于「推荐/分享/主页/朋友/订阅号/关注/其他」这组来源分解。
-  const rows = tabs.map((t) => { const d = (t && t.data) || {}; const row = { channel: (t && t.tabTypeName) || ('type' + (t && t.tabType)) }; for (const m of METRICS) row[m] = sum(d[m]); return row; });
   const KNOWN_CH = ['推荐', '分享', '主页', '朋友♡', '订阅号消息', '关注'];
-  // 汇总总量：用接口自带的 totalData，它是后台显示的权威汇总值。
-  // 不能对 dataByTabtype 求和——同一作品会被多个来源渠道重复曝光，like/fav 等会重复计数
-  // （例如"推荐"里的 like 与"订阅号消息/朋友"里的同一条可能重叠，求和会多算）。
+  // 总量只采用 totalData；渠道间可能重叠，不能作为缺失总量的替代值。
   const td = (post.data && post.data.totalData) || {};
-  const total = {}; for (const m of METRICS) total[m] = Array.isArray(td[m]) ? sum(td[m]) : rows.reduce((a, r) => a + r[m], 0);
-  // 来源分解：只输出已知渠道；PC微信/看一看/其他 以及**平台新增的未知渠道**一律并入「其他」，
-  // 避免出现"某个渠道的播放量被丢弃、分解之和 != 总播放量"。
-  // 必须累加（+=）：同名渠道返回多行时，赋值会丢掉前一行，分解之和就真的对不上总量了。
-  const brk = {}; for (const c of KNOWN_CH) brk[c] = 0;
-  brk['其他'] = 0;
-  for (const r of rows) { const v = parseInt(r.browse, 10) || 0; if (KNOWN_CH.includes(r.channel)) brk[r.channel] += v; else brk['其他'] += v; }
-  // 汇总段的静默失败要显式上报：缺 totalData 时退化为"渠道分解求和"，而分解之间存在重复曝光，数值可能偏大。
+  const total = {}; for (const [key] of METRICS) total[key] = channelsSum(td[key]);
+  // 同名来源累加，未知来源并入「其他」。未返回或任一分项异常的来源留空。
+  const groups = new Map();
+  for (const tab of tabs) {
+    const channel = KNOWN_CH.includes(tab && tab.tabTypeName) ? tab.tabTypeName : '其他';
+    if (!groups.has(channel)) groups.set(channel, []);
+    groups.get(channel).push(channelsSum(tab && tab.data && tab.data.browse));
+  }
+  const brk = {}; for (const channel of [...KNOWN_CH, '其他']) brk[channel] = channelsSum(groups.get(channel));
   const earlyWarns = [];
-  if (!(post.data && post.data.totalData)) earlyWarns.push('汇总接口未返回 totalData，总播放/互动量改用渠道分解求和，可能重复计数');
-  const badTd = METRICS.filter((m) => td[m] != null && !Array.isArray(td[m]));
-  if (badTd.length) earlyWarns.push('汇总字段格式异常（' + badTd.join('/') + '），该指标改用渠道分解求和');
+  const missingTotal = METRICS.filter(([key]) => total[key] === '').map(([, label]) => label);
+  if (missingTotal.length) earlyWarns.push('汇总字段缺失或异常（' + missingTotal.join('、') + '），对应单元格留空');
+  const missingSources = Object.keys(brk).filter((channel) => brk[channel] === '');
+  if (missingSources.length) earlyWarns.push('播放来源缺失或异常（' + missingSources.join('、') + '），对应单元格留空');
   let fans = null, fansWarn = '';
   try {
     const f = await axhr(vx('fans_trend'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -136,8 +149,11 @@ async function channelsExtract(period) {
       const d = f.data;
       // total[] 逐日累计且已含当日净增（Δtotal[i] === netAdd[i]），last(total) 即该周期末尾收盘值；
       // 不要再加 last(netAdd)，否则把最后一天净增重复算一遍。
-      if (!Array.isArray(d.total) || !Array.isArray(d.netAdd)) fansWarn = '接口返回结构异常（缺少 total / netAdd）';
-      else fans = { monthEnd: parseInt(last(d.total), 10) || 0, netAdd: sum(d.netAdd) };
+      fans = { monthEnd: channelsNumber(last(d.total), { integer: true }), netAdd: channelsSum(d.netAdd, { allowNegative: true }) };
+      const missing = [];
+      if (fans.netAdd === '') missing.push('关注者量');
+      if (fans.monthEnd === '') missing.push('关注者总数');
+      if (missing.length) fansWarn = missing.join(' / ') + '缺失或格式异常';
     } else if (f.errCode !== 0) {
       if (f.errCode === 300333 || f.errCode === 300334) fansWarn = '登录已失效（错误码' + f.errCode + '）';
       else if (f.errCode === 300800) fansWarn = '请求被平台拒绝（错误码300800：' + (f.errMsg || '') + '）';
@@ -163,12 +179,19 @@ async function channelsExtract(period) {
       if (page >= 50) { postTruncated = true; break; } // 安全上限，防死循环（命中即上报截断）
       page++; await sleep(600);
     }
-    posts = all.map((it, i) => { const m = (it.desc && it.desc.media && it.desc.media[0]) || {}; const coverUrl = m.coverUrl || m.fullCoverUrl || m.thumbUrl || ''; return { publish: cDate(it.createTime), durationSec: m.videoPlayLen != null ? m.videoPlayLen : 0, plays: it.readCount, fullRate: it.fullPlayRate != null ? pct(it.fullPlayRate) : '', avgPlay: it.avgPlayTimeSec != null ? Number(it.avgPlayTimeSec).toFixed(2) : '0', friends: it.likeCount, likes: it.favCount, comments: it.commentCount, shares: it.forwardAggregationCount, follows: it.followCount, wclick: it.wecomLinkClickCount != null ? it.wecomLinkClickCount : '', wuv: it.wecomLinkClickUv != null ? it.wecomLinkClickUv : '', wadd: it.wecomContactAddCount != null ? it.wecomContactAddCount : '', wadduv: it.wecomContactAddUv != null ? it.wecomContactAddUv : '', coverUrl, coverFileName: (coverUrl ? String(i + 1).padStart(2, '0') + '_' + it.createTime + '.jpg' : '') }; });
+    posts = all.map((it, i) => {
+      const m = (it.desc && it.desc.media && it.desc.media[0]) || {};
+      const avgPlay = channelsNumber(it.avgPlayTimeSec);
+      const coverUrl = m.coverUrl || m.fullCoverUrl || m.thumbUrl || '';
+      return { publish: cDate(it.createTime), durationSec: channelsNumber(m.videoPlayLen), plays: it.readCount, fullRate: it.fullPlayRate != null ? pct(it.fullPlayRate) : '', avgPlay: avgPlay === '' ? '' : avgPlay.toFixed(2), friends: it.likeCount, likes: it.favCount, comments: it.commentCount, shares: it.forwardAggregationCount, follows: it.followCount, wclick: it.wecomLinkClickCount != null ? it.wecomLinkClickCount : '', wuv: it.wecomLinkClickUv != null ? it.wecomLinkClickUv : '', wadd: it.wecomContactAddCount != null ? it.wecomContactAddCount : '', wadduv: it.wecomContactAddUv != null ? it.wecomContactAddUv : '', coverUrl, coverFileName: (coverUrl ? String(i + 1).padStart(2, '0') + '_' + it.createTime + '.jpg' : '') };
+    });
     postCsv = toCsv([['发布日期', '封面', '作品时长', '播放量', '完播率', '平均播放时长', '朋友量', '点赞量', '评论量', '分享量', '关注量', '企微点击次数', '企微点击人数', '添加通讯录次数', '添加通讯录人数']].concat(posts.map((p) => [p.publish, p.coverFileName, p.durationSec, p.plays, p.fullRate, p.avgPlay, p.friends, p.likes, p.comments, p.shares, p.follows, p.wclick, p.wuv, p.wadd, p.wadduv])));
   } catch (e) { postWarn = String((e && e.message) || e); }
-  // 汇总各段警告：粉丝数据失败会让「关注者量/关注者总数」两列为空，必须显式告知，避免误以为"本期没涨粉"。
+  // 汇总各段警告：关注者字段独立留空并提示，避免将缺失误解为本期零增长。
   const warns = [].concat(earlyWarns);
-  if (fansWarn) warns.push('关注者数据获取失败（' + fansWarn + '），“关注者量 / 关注者总数”两列为空');
+  if (fansWarn) warns.push('关注者数据不完整（' + fansWarn + '），缺失或异常单元格留空');
+  const missingDurations = posts.filter((p) => p.durationSec === '' || p.avgPlay === '').length;
+  if (missingDurations) warns.push(missingDurations + ' 篇作品的时长或平均播放时长缺失或异常，对应单元格留空');
   if (postTruncated) warns.push('作品数超过 50 页（约 5000 条）上限，仅导出前 ' + posts.length + ' 条');
   if (postWarn) warns.push('单篇获取失败，请重试（' + postWarn + '）');
   return { platform: '视频号', scopeLabel, periodName: R.label, period: R.label, rangeText: fmtRange(R.startD) + '-' + fmtRange(R.endD), summaryCsv, postCsv, posts, coverFolder: R.label + '_' + scopeLabel + '作品封面', count: posts.length, warning: warns.join('；') };
@@ -207,18 +230,31 @@ async function douyinExtract(period, concurrency) {
   const summaryCsv = toCsv([['周期', '投稿量', '主页访问', '总播放量', '总点赞量', '总评论量', '总分享量', '5秒完播率', '2秒跳出率', '封面点击率', '平均播放时长', '粉丝净增', '吸粉量', '脱粉量', '回访粉丝量', '总粉丝量'], [R.label, M(dash, 'publish_cnt'), M(dash, 'homepage_view_cnt'), M(dash, 'play_cnt'), M(dash, 'digg_cnt'), M(dash, 'comment_cnt'), M(dash, 'share_count'), pct(M(dash, 'completion_rate_5s')), pct(M(dash, 'bounce_rate_2s')), pct(M(dash, 'cover_click_ratio')), avgViewFmt, M(fans, 'net_fans_cnt'), M(fans, 'new_fans_cnt'), M(fans, 'cancel_fans_cnt'), M(fans, 'home_view_fans_cnt'), M(fans, 'total_fans_cnt')]]);
   let posts = [], postCsv = '', postWarn = '';
   // 列表/明细段的「部分成功」也必须上报：截断、游标停住、补充接口失败都不能静默
-  let postTruncated = false, cursorStuck = false, srcFail = 0, kwFail = 0, extraLogin = false;
+  let postTruncated = false, cursorStuck = false, srcFail = 0, kwFail = 0, extraLogin = false, duplicates = 0, missingIds = 0;
   try {
     // 收集 work_list 的 items[]（含全部指标 metrics）+ aweme_list[]（含时长 duration），按作品 ID 关联
-    let all = [], cursor = 0, guard = 0, itemIdSet = new Set();
+    const byId = new Map();
+    let cursor = 0, guard = 0;
     while (true) {
       const j = await axhr('https://creator.douyin.com/janus/douyin/creator/pc/work_list?status=0&count=40&max_cursor=' + cursor + '&scene=star_atlas&device_platform=android&aid=1128');
       assertLogin(j);
       const its = Array.isArray(j.items) ? j.items : [], aws = Array.isArray(j.aweme_list) ? j.aweme_list : [];
-      // 本页：按 item.id === aweme.item_id 关联；避免依赖数组同序/同长，防止 A 的指标+B 的时长/ID 错配
-      const awmap = new Map(); for (const aw of aws) { const k = aw && aw.item_id != null ? String(aw.item_id) : null; if (k != null) awmap.set(k, aw); }
-      for (const it of its) { const k = it && it.id != null ? String(it.id) : null; all.push({ item: it, aweme: k != null ? (awmap.get(k) || null) : null }); if (k != null) itemIdSet.add(k); }
-      for (const aw of aws) { const k = aw && aw.item_id != null ? String(aw.item_id) : null; if (k != null && !itemIdSet.has(k)) { all.push({ item: null, aweme: aw }); itemIdSet.add(k); } }
+      // 在整次分页中按 ID 关联，保留首次取得的指标；后续页只补齐缺少的作品/时长。
+      for (const it of its) {
+        const id = it && it.id != null ? String(it.id) : '';
+        if (!id) { missingIds++; continue; }
+        const entry = byId.get(id);
+        if (!entry) byId.set(id, { item: it, aweme: null });
+        else if (!entry.item) entry.item = it;
+        else duplicates++;
+      }
+      for (const aw of aws) {
+        const id = aw && aw.item_id != null ? String(aw.item_id) : '';
+        if (!id) continue;
+        const entry = byId.get(id);
+        if (!entry) byId.set(id, { item: null, aweme: aw });
+        else if (!entry.aweme) entry.aweme = aw;
+      }
       if (!j.has_more || (!its.length && !aws.length)) break;
       // 列表按 create_time 倒序：本页作品全部早于统计区间起点时，后续不可能再有区间内作品，提前结束。
       // （旧实现会为只要一个月的账号一路翻到 200 页，请求量与读取面远超「低频只读」的定位）
@@ -228,7 +264,7 @@ async function douyinExtract(period, concurrency) {
       if (++guard > 200) { postTruncated = true; break; }   // 安全上限
       cursor = next; await sleep(600);
     }
-    const metas = all.filter((it) => it.item && it.item.create_time && cDateYmd(it.item.create_time) >= R.startD && cDateYmd(it.item.create_time) <= R.endD).sort((a, b) => (b.item.create_time || 0) - (a.item.create_time || 0));
+    const metas = [...byId.values()].filter((it) => it.item && it.item.create_time && cDateYmd(it.item.create_time) >= R.startD && cDateYmd(it.item.create_time) <= R.endD).sort((a, b) => (b.item.create_time || 0) - (a.item.create_time || 0));
     const mOf = (it) => (it.item && it.item.metrics) || {};
     const srcName = (k) => ({ homepage_hot: '推荐页', familiar: '朋友页', follow: '关注页', homepage: '个人主页', search: '搜索' }[k] || k);
     const coverOf = (cur) => { const c = cur && cur.cover; if (!c) return ''; const o = Array.isArray(c) ? c[0] : c; return (o && o.url_list && o.url_list[0]) || ''; };
@@ -256,6 +292,8 @@ async function douyinExtract(period, concurrency) {
   const notes = [];
   if (postTruncated) notes.push('作品数超过 200 页（约 8000 条）上限，仅导出前 ' + posts.length + ' 条');
   if (cursorStuck) notes.push('作品列表分页游标未推进，可能只抓取了部分作品');
+  if (duplicates) notes.push('已去重 ' + duplicates + ' 条重复作品；分页期间列表可能发生变化，请核对作品数量');
+  if (missingIds) notes.push(missingIds + ' 条作品缺少有效 ID，已跳过');
   if (srcFail) notes.push('「最大流量来源」有 ' + srcFail + ' 篇获取失败');
   if (kwFail) notes.push('「搜索关键词」有 ' + kwFail + ' 篇获取失败');
   if (extraLogin) notes.push('部分明细接口提示登录失效，建议刷新页面后重试');

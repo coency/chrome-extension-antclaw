@@ -223,7 +223,12 @@ async function biliProgressPosts(posts, warning, stopped = false) {
   return { loginExpired };
 }
 
-async function biliEnrichPosts(posts, warning) {
+async function biliEnrichPosts(posts, warning, stopped = false) {
+  if (stopped) {
+    for (const post of posts) for (const [, field] of BILI_DETAIL_METRICS) post[field] = '';
+    if (posts.length) warning.push('登录失效，未请求补充互动统计（评论、收藏、投币、分享、弹幕），相关列留空');
+    return { loginExpired: true };
+  }
   let failed = 0, skipped = 0, noBvid = 0, loginExpired = false, firstError = '';
   const missing = new Map();
   // 仅补充已选中且去重后的作品；最多 2 并发，同一工作流请求间隔 600ms。
@@ -272,7 +277,13 @@ async function bilibiliExtract(period) {
     if (e.loginExpired) throw e;
     warning.push('汇总获取失败：' + e.message);
   }
-  const extraTotals = await biliExtraSummary(R, warning);
+  let loginExpired = false, extraTotals = [''];
+  try { extraTotals = await biliExtraSummary(R, warning); }
+  catch (e) {
+    if (!e.loginExpired || !totals.some((value) => value !== '')) throw e;
+    loginExpired = true;
+    warning.push('扩展汇总获取失败：' + e.message + '；已保留基础汇总，停止后续作品请求');
+  }
   if (totals.concat(extraTotals).some((value) => value !== '')) {
     summaryCsv = toCsv([
       ['周期', '开始日期', '结束日期', ...BILI_METRICS.map(([, label]) => label), ...BILI_EXTRA_SUMMARY_HEADERS],
@@ -282,7 +293,7 @@ async function bilibiliExtract(period) {
 
   let invalidPosts = 0, missingMetrics = 0, unavailableCovers = 0, duplicates = 0;
   try {
-    for (let page = 1; page <= BILI_MAX_PAGES; page++) {
+    for (let page = 1; !loginExpired && page <= BILI_MAX_PAGES; page++) {
       const data = await biliRequest('archive/index', { pn: page, ps: BILI_PAGE_SIZE, scene: 'archive_compare', order: 0 });
       if (!Array.isArray(data.list)) throw new Error('作品列表格式异常');
       const pager = data.pager || {}, total = biliNumber(pager.total);
@@ -323,7 +334,10 @@ async function bilibiliExtract(period) {
       await sleep(600);
     }
   } catch (e) {
-    if (e.loginExpired) throw e;
+    if (e.loginExpired) {
+      if (!summaryCsv && !listAvailable) throw e;
+      loginExpired = true;
+    }
     warning.push('作品获取失败，已获取的作品予以保留，列表可能不完整：' + e.message);
   }
   if (invalidPosts) warning.push(invalidPosts + ' 条作品缺少有效标识或发布时间，已跳过');
@@ -332,7 +346,7 @@ async function bilibiliExtract(period) {
   if (unavailableCovers) warning.push(unavailableCovers + ' 篇作品无可用封面或封面域名暂不支持');
   posts.sort((a, b) => b.pubtime - a.pubtime);
   posts.forEach((post, i) => { post.coverFileName = post.coverUrl ? String(i + 1).padStart(2, '0') + '_' + post.id + '.' + post.coverExtension : ''; });
-  const enrichment = await biliEnrichPosts(posts, warning);
+  const enrichment = await biliEnrichPosts(posts, warning, loginExpired);
   const progress = await biliProgressPosts(posts, warning, enrichment.loginExpired);
   await biliComparePosts(posts, warning, progress.loginExpired);
   if (listAvailable) {

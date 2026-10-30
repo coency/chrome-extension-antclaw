@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "爬爬蚁",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "description": "多平台创作者数据中心导出 CSV：抖音、视频号、哔哩哔哩。自然周/月汇总、作品明细与封面；B站作品按发布日期筛选累计数据。",
   "icons": {
     "16": "icon16.png",

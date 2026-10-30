@@ -210,9 +210,12 @@ $('extract').addEventListener('click', doExtract);
 $('csv').addEventListener('click', async () => { if (!latest || !latest.summaryCsv) { setStatus('请先「提取数据」或本次汇总数据不可用', true); return; } const ok = await download(latest.platform + '_' + latest.periodName + '_' + latest.scopeLabel + '汇总数据统计.csv', '\uFEFF' + latest.summaryCsv, 'text/csv'); if (ok) setStatus('已发起下载汇总CSV'); });
 $('postCsv').addEventListener('click', async () => { if (!latest || !latest.posts || !latest.posts.length) { setStatus('请先「提取数据」或本期无作品', true); return; } const ok = await download(latest.platform + '_' + latest.periodName + '_' + latest.scopeLabel + '作品数据统计.csv', '\uFEFF' + latest.postCsv, 'text/csv'); if (ok) setStatus('已发起下载单篇CSV'); });
 $('zipCover').addEventListener('click', async () => {
-  if (!latest || !latest.posts || !latest.posts.length) { setStatus('请先「提取数据」或无封面', true); return; }
+  const result = latest;
+  if (!result || !result.posts || !result.posts.length) { setStatus('请先「提取数据」或无封面', true); return; }
   try {
-    const targets = latest.posts.filter((p) => p.coverUrl && p.coverFileName);
+    // 文件名和下载目标取同一批快照；新提取结果可能在异步下载期间替换 latest。
+    const zipName = result.platform + '_' + result.coverFolder + '.zip';
+    const targets = result.posts.filter((p) => p.coverUrl && p.coverFileName).map((p) => ({ coverUrl: p.coverUrl, coverFileName: p.coverFileName }));
     if (!targets.length) { setStatus('本期作品没有可用的封面链接', true); return; }
     setStatus('正在打包封面… 0/' + targets.length);
     const fails = []; let done = 0;
@@ -233,7 +236,7 @@ $('zipCover').addEventListener('click', async () => {
     });
     const list = files.filter(Boolean);
     if (!list.length) { setStatus('没有可打包封面（共尝试 ' + targets.length + ' 张' + (fails.length ? '，失败 ' + fails.length + ' 张，如：' + fails.slice(0, 3).join('、') : '') + '）', true); return; }
-    const saved = await saveBlob(latest.platform + '_' + latest.coverFolder + '.zip', buildZip(list));
+    const saved = await saveBlob(zipName, buildZip(list));
     if (!saved) return;
     setStatus('已打包 ' + list.length + ' 张封面' + (fails.length ? '（' + fails.length + ' 张失败：' + fails.slice(0, 3).join('、') + (fails.length > 3 ? ' 等' : '') + '，可能因图片链接过期或封面域名缺少权限）' : ''));
   } catch (e) { setStatus('失败: ' + e.message, true); }

@@ -39,10 +39,10 @@ function background(local = storage()) {
   const send = (message, tabId = 1) => new Promise((resolve) => listener(message, { tab: { id: tabId } }, resolve));
   return { local, send, events, notifications };
 }
-function content(sendMessage = async () => {}) {
+function content(sendMessage = async () => {}, overrides = {}) {
   let listener;
   const context = vm.createContext({
-    Date, console, AbortController, setTimeout, clearTimeout,
+    Date, console, AbortController, setTimeout, clearTimeout, ...overrides,
     chrome: { runtime: { sendMessage, onMessage: { addListener(fn) { listener = fn; } } } },
   });
   vm.runInContext(source('content.js'), context);
@@ -341,4 +341,241 @@ test('取消平台的旧错误不影响恢复其他平台的成功结果', async
   assert.equal(ui.elements.postCsv.disabled, false);
   assert.match(ui.elements.result.textContent, /哔哩哔哩/);
   assert.doesNotMatch(ui.elements.status.textContent, /旧错误/);
+});
+
+
+// 固定时钟与合成响应：不访问真实平台或控制浏览器。
+class ReviewDate extends Date {
+  constructor(...args) { super(...(args.length ? args : ['2026-10-28T12:00:00+08:00'])); }
+  static now() { return new ReviewDate().getTime(); }
+}
+const channelNames = ['推荐', '分享', '主页', '朋友♡', '订阅号消息', '关注', '其他'];
+const channelTotals = () => Object.fromEntries(['browse', 'like', 'fav', 'comment', 'forward'].map((key) => [key, [0, '0']]));
+async function channelResult({ totalData = channelTotals(), tabs = channelNames.map((tabTypeName) => ({ tabTypeName, data: { browse: [0] } })), fans = { total: [10, 8], netAdd: [0, -2] }, posts = [] } = {}) {
+  const { context } = content(undefined, { Date: ReviewDate });
+  context.reply = { totalData, dataByTabtype: tabs };
+  context.fans = fans;
+  context.items = posts;
+  vm.runInContext(`readFinderId = async () => 'test@finder';
+    axhr = async url => ({errCode: 0, data: url.includes('new_post_total_data') ? reply
+      : url.includes('fans_trend') ? fans : {list: items, totalCount: items.length}})`, context);
+  return vm.runInContext('channelsExtract("month")', context);
+}
+const summaryRow = (result) => result.summaryCsv.trimEnd().split('\n')[1].split(',');
+
+test('视频号空汇总、渠道和粉丝数组留空并提示，不制造零值', async () => {
+  const result = await channelResult({ totalData: {}, tabs: [], fans: { total: [], netAdd: [] } });
+  assert.deepEqual(summaryRow(result).slice(1), Array(14).fill(''));
+  assert.match(result.warning, /汇总.*留空/);
+  assert.match(result.warning, /来源.*留空/);
+  assert.match(result.warning, /关注者.*留空/);
+});
+
+test('视频号真实零值及负数净增保持有效', async () => {
+  const result = await channelResult();
+  assert.deepEqual(summaryRow(result).slice(1), [...Array(12).fill('0'), '-2', '8']);
+  assert.equal(result.warning, '');
+});
+
+test('视频号缺失总量不能用存在重叠的渠道分解代替', async () => {
+  const result = await channelResult({ totalData: null, tabs: [
+    { tabTypeName: '推荐', data: { browse: [9], like: [3] } },
+    { tabTypeName: '分享', data: { browse: [7], like: [3] } },
+  ] });
+  const row = summaryRow(result);
+  assert.equal(row[1], '');
+  assert.equal(row[9], '');
+  assert.equal(row[2], '9');
+  assert.equal(row[3], '7');
+  assert.match(result.warning, /汇总.*留空/);
+});
+
+test('视频号异常数组不截断、不部分相加、不转换成零', async () => {
+  for (const bad of [undefined, null, [], 12, {}, [null], [''], ['  '], [false], ['12px'], [1.5], [-1], [Infinity], [NaN], [1, null], [Number.MAX_SAFE_INTEGER, 1]]) {
+    const result = await channelResult({ totalData: { ...channelTotals(), browse: bad } });
+    assert.equal(summaryRow(result)[1], '', JSON.stringify(bad));
+    assert.equal(summaryRow(result)[10], '0');
+    assert.match(result.warning, /播放量.*留空/);
+  }
+});
+
+test('视频号来源同名累加，未知来源并入其他；含无效数据的来源独立留空', async () => {
+  const result = await channelResult({ tabs: [
+    { tabTypeName: '推荐', data: { browse: [2, 3] } },
+    { tabTypeName: '推荐', data: { browse: ['4'] } },
+    { tabTypeName: '分享', data: { browse: [5] } },
+    { tabTypeName: '分享', data: { browse: [null] } },
+    { tabTypeName: '新渠道', data: { browse: [7] } },
+    { tabTypeName: '其他', data: { browse: [1] } },
+  ] });
+  const row = summaryRow(result);
+  assert.equal(row[1], '0');
+  assert.equal(row[2], '9');
+  assert.equal(row[3], '');
+  assert.equal(row[8], '8');
+  assert.match(result.warning, /来源.*分享.*留空/);
+});
+
+test('视频号粉丝两列分别校验，保留仍然有效的一列', async () => {
+  for (const [fans, expected] of [
+    [{ total: [], netAdd: [-1, 2] }, ['1', '']],
+    [{ total: [9], netAdd: [] }, ['', '9']],
+    [{ total: [null], netAdd: [0] }, ['0', '']],
+  ]) {
+    const result = await channelResult({ fans });
+    assert.deepEqual(summaryRow(result).slice(13), expected);
+    assert.match(result.warning, /关注者.*留空/);
+  }
+});
+
+test('视频号作品缺少时长与平均播放时长时留空，真实零值正常输出', async () => {
+  const result = await channelResult({ posts: [
+    { createTime: 1789444800 },
+    { createTime: 1789444801, desc: { media: [{ videoPlayLen: 0 }] }, avgPlayTimeSec: 0 },
+    { createTime: 1789444802, desc: { media: [{ videoPlayLen: 'bad' }] }, avgPlayTimeSec: 'bad' },
+  ] });
+  assert.equal(result.posts[0].durationSec, '');
+  assert.equal(result.posts[0].avgPlay, '');
+  assert.equal(result.posts[1].durationSec, 0);
+  assert.equal(result.posts[1].avgPlay, '0.00');
+  assert.equal(result.posts[2].durationSec, '');
+  assert.equal(result.posts[2].avgPlay, '');
+  assert.match(result.warning, /时长.*留空/);
+});
+
+test('共享请求超时覆盖 JSON 响应体读取，超时后重试并清理计时器', async () => {
+  const timers = new Map();
+  let sequence = 0, attempts = 0, aborted = false;
+  const { context } = content(undefined, {
+    setTimeout(fn, ms) {
+      if (ms !== 20000) return setTimeout(fn, 0);
+      const id = ++sequence; timers.set(id, fn); return id;
+    },
+    clearTimeout(id) { if (!timers.delete(id)) clearTimeout(id); },
+    async fetch(url, { signal }) {
+      attempts++;
+      return { ok: true, json: attempts === 1
+        ? () => new Promise((resolve, reject) => signal.addEventListener('abort', () => { aborted = true; reject(new Error('aborted body')); }, { once: true }))
+        : async () => ({ value: 7 }) };
+    },
+  });
+  const request = vm.runInContext('axhr("https://example.test")', context);
+  await tick();
+  assert.equal(timers.size, 1, '收到响应头后仍须保留响应体的超时保护');
+  [...timers.values()][0]();
+  assert.equal((await request).value, 7);
+  assert.equal(aborted, true);
+  assert.equal(attempts, 2);
+  assert.equal(timers.size, 0);
+});
+
+test('共享请求的 JSON 解析失败最多尝试三次，失败后清理计时器', async () => {
+  let attempts = 0;
+  const timers = new Set();
+  const { context } = content(undefined, {
+    setTimeout(fn, ms) { const id = setTimeout(fn, ms === 900 ? 0 : ms); if (ms === 20000) timers.add(id); return id; },
+    clearTimeout(id) { timers.delete(id); clearTimeout(id); },
+    async fetch() { attempts++; return { ok: true, async json() { throw new Error('bad json'); } }; },
+  });
+  await assert.rejects(vm.runInContext('axhr("https://example.test")', context), /请求失败/);
+  assert.equal(attempts, 3);
+  assert.equal(timers.size, 0);
+});
+
+test('共享请求 HTTP 错误不重试、不读取响应体且清理计时器', async () => {
+  let attempts = 0, reads = 0, cleared = 0;
+  const { context } = content(undefined, {
+    setTimeout: () => 1, clearTimeout: () => { cleared++; },
+    async fetch() { attempts++; return { ok: false, status: 403, async json() { reads++; } }; },
+  });
+  await assert.rejects(vm.runInContext('axhr("https://example.test")', context), /HTTP 403/);
+  assert.equal(attempts, 1);
+  assert.equal(reads, 0);
+  assert.equal(cleared, 1);
+});
+
+const douyinItem = (id, count = 7) => ({ id, description: '作品' + id, create_time: new Date('2026-09-15T12:00:00+08:00').getTime() / 1000, metrics: { view_count: count } });
+async function douyinPages(pages) {
+  const calls = [];
+  const { context } = content(undefined, { Date: ReviewDate, setTimeout: (fn, ms) => setTimeout(fn, ms === 600 ? 0 : ms) });
+  context.axhr = async (url) => {
+    calls.push(url);
+    if (url.includes('work_list')) {
+      const index = Number(new URL(url).searchParams.get('max_cursor'));
+      return { status_code: 0, ...pages[index], has_more: index < pages.length - 1, max_cursor: index + 1 };
+    }
+    return { status_code: 0, metrics: [{ english_metric_name: 'play_cnt', metric_value: 1 }] };
+  };
+  return { result: await vm.runInContext('douyinExtract("month", 4)', context), calls };
+}
+
+test('抖音跨页重复作品只导出及补充查询一次，保留首次取得的指标', async () => {
+  const { result, calls } = await douyinPages([
+    { items: [douyinItem('1')] },
+    { items: [douyinItem('1', 999), douyinItem('2')] },
+  ]);
+  assert.equal(result.count, 2);
+  assert.deepEqual(Array.from(result.posts, (p) => p.plays), [7, 7]);
+  assert.equal(result.postCsv.trimEnd().split('\n').length, 3);
+  assert.equal(calls.filter((url) => url.includes('/item/play/source')).length, 2);
+  assert.equal(calls.filter((url) => url.includes('/item_analysis/search/keyword')).length, 2);
+  assert.match(result.warning, /去重 1 条重复作品/);
+});
+
+test('抖音同页数字和字符串 ID 视为同一作品，时长按 ID 关联', async () => {
+  const { result } = await douyinPages([{ items: [douyinItem(1), douyinItem('1'), douyinItem('2')], aweme_list: [{ item_id: '2', duration: 22000 }, { item_id: '1', duration: 11000 }] }]);
+  assert.equal(result.count, 2);
+  assert.deepEqual(Array.from(result.posts, (p) => p.duration), [11, 22]);
+  assert.match(result.warning, /去重 1 条重复作品/);
+});
+
+test('抖音后续页补齐先前只有时长的作品，按 ID 合并为一条', async () => {
+  const { result } = await douyinPages([
+    { items: [douyinItem('1')], aweme_list: [{ item_id: '2', duration: 22000 }] },
+    { items: [douyinItem('2')], aweme_list: [{ item_id: '1', duration: 11000 }] },
+  ]);
+  assert.equal(result.count, 2);
+  assert.deepEqual(Array.from(result.posts, (p) => p.duration), [11, 22]);
+  assert.equal(result.warning, '');
+});
+
+test('封面下载期间收到另一平台周期结果，ZIP 名称和内容仍属启动时的批次', async () => {
+  const old = { ...sample, platform: '哔哩哔哩', coverFolder: '2026年09月_月度作品封面', posts: [{ coverUrl: 'https://i0.hdslb.com/A.png', coverFileName: 'A.png' }] };
+  const local = storage({ lastResult: old });
+  const ui = popup(local);
+  await tick();
+  const pending = deferred(), saved = [], fetched = [];
+  ui.context.fetch = async (url) => { fetched.push(url); await pending.promise; return { ok: true, arrayBuffer: async () => Uint8Array.from([7, 8]).buffer }; };
+  ui.context.saveBlob = async (name, blob) => { saved.push({ name, blob }); return true; };
+  const download = ui.elements.zipCover.events.click();
+  await tick();
+  await local.set({ lastResult: { ...sample, period: '2026年43周', scopeLabel: '周度', coverFolder: '2026年43周_周度作品封面', posts: [{ coverUrl: 'https://example.test/B.jpg', coverFileName: 'B.jpg' }] } });
+  ui.event({ type: 'extractDone' });
+  await tick();
+  assert.equal(ui.elements.platform.value, '抖音');
+  pending.resolve();
+  await download;
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].name, '哔哩哔哩_2026年09月_月度作品封面.zip');
+  assert.deepEqual(fetched, [old.posts[0].coverUrl]);
+  const zip = Buffer.from(await saved[0].blob.arrayBuffer());
+  assert.equal(zip.readUInt32LE(0), 0x04034b50);
+  const nameLength = zip.readUInt16LE(26), extraLength = zip.readUInt16LE(28);
+  assert.equal(zip.subarray(30, 30 + nameLength).toString(), 'A.png');
+  const offset = 30 + nameLength + extraLength;
+  assert.deepEqual([...zip.subarray(offset, offset + zip.readUInt32LE(18))], [7, 8]);
+});
+
+
+test('抖音缺少 ID 的作品明确跳过，不发出无法关联的补充请求', async () => {
+  const { result, calls } = await douyinPages([{ items: [douyinItem(undefined), douyinItem(''), null, douyinItem('1')] }]);
+  assert.equal(result.count, 1);
+  assert.equal(result.posts[0].title, '作品1');
+  assert.match(result.warning, /3 条作品缺少有效 ID，已跳过/);
+  const details = calls.filter((url) => url.includes('/item/') || url.includes('/item_analysis/'));
+  assert.equal(details.length, 2);
+  for (const url of details) {
+    const params = new URL(url).searchParams;
+    assert.equal(params.get('item_id') || params.get('id'), '1');
+  }
 });

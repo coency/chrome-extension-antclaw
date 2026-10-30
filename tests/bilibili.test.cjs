@@ -286,7 +286,7 @@ test('真实消息分发可路由到 B 站适配器并提交完成结果', async
 test('清单从 B 站顶层页面注入适配器，所有引用文件存在且封面权限齐全', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'));
   const script = manifest.content_scripts.find((entry) => entry.matches.includes('https://member.bilibili.com/*'));
-  assert.deepEqual(script.js, ['bilibili.js', 'bilibili-sample.js', 'content.js']);
+  assert.deepEqual(script.js, ['bilibili.js', 'content.js']);
   assert.ok(!script.all_frames);
   for (const file of [...manifest.content_scripts.flatMap((entry) => entry.js), manifest.action.default_popup, manifest.background.service_worker, ...Object.values(manifest.icons)]) {
     assert.ok(fs.existsSync(path.join(root, file)), file);
@@ -294,7 +294,9 @@ test('清单从 B 站顶层页面注入适配器，所有引用文件存在且�
   for (const host of ['member.bilibili.com', 'i0.hdslb.com', 'i1.hdslb.com', 'i2.hdslb.com']) assert.ok(manifest.host_permissions.includes('https://' + host + '/*'));
   const html = fs.readFileSync(path.join(root, 'popup.html'), 'utf8');
   assert.match(html, /<option value="哔哩哔哩">/);
-  assert.match(html, /<option value="小红书" disabled>/);
+  assert.doesNotMatch(html, /小红书|xiaohongshu|xhs/i);
+  assert.ok(!manifest.host_permissions.some((host) => /xiaohongshu|xhscdn/.test(host)));
+  assert.ok(!manifest.content_scripts.some((entry) => entry.matches.some((host) => /xiaohongshu/.test(host))));
 });
 
 test('作品 CSV 新增五项累计互动，字段与数值对应且不改变原有统计', async () => {

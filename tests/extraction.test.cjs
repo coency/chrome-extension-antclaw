@@ -73,34 +73,6 @@ function popup(local, overrides = {}) {
 const begin = { type: 'beginExtraction', platform: '抖音', period: 'month' };
 const sample = { platform: '抖音', scopeLabel: '月度', period: '2026年09月', count: 1, posts: [{}], summaryCsv: 'csv', postCsv: 'csv' };
 
-test('B 站分析样本共用任务锁、独立保存，不覆盖原 CSV 结果', async () => {
-  const app = background(storage({ lastResult: sample }));
-  const started = await app.send({ type: 'beginExtraction', platform: '哔哩哔哩', period: 'sample-20260929' });
-  assert.equal(started.ok, true);
-  assert.equal((await app.send(begin, 2)).busy, true);
-  const data = { targetDate: '2026-09-29', works: [{ bvid: 'BV0000000001' }], warnings: [] };
-  const result = await app.send({ type: 'endExtraction', taskId: started.taskId, data });
-  assert.equal(result.ok, true);
-  assert.deepEqual(app.local.state.lastResult, sample);
-  assert.deepEqual(app.local.state.biliSampleResult, data);
-  assert.equal(app.local.state.running, false);
-  assert.match(app.notifications[0].message, /分析样本已采集/);
-  assert.ok((await app.send({ type: 'beginExtraction', platform: '哔哩哔哩', period: 'month' })).cooldown > 0);
-});
-
-test('样本采集失败释放锁并保留旧样本及 CSV，不把样本错误写成周期提取错误', async () => {
-  const oldSample = { targetDate: '2026-09-29', works: [] };
-  const app = background(storage({ lastResult: sample, biliSampleResult: oldSample }));
-  const started = await app.send({ type: 'beginExtraction', platform: '哔哩哔哩', period: 'sample-20260929' });
-  const result = await app.send({ type: 'endExtraction', taskId: started.taskId, error: 'sample failed' });
-  assert.equal(result.ok, false);
-  assert.equal(app.local.state.running, false);
-  assert.equal(app.local.state.biliSampleError, 'sample failed');
-  assert.equal(app.local.state.lastError, null);
-  assert.deepEqual(app.local.state.lastResult, sample);
-  assert.deepEqual(app.local.state.biliSampleResult, oldSample);
-});
-
 for (const code of [8, 1001]) {
   test(`抖音明细业务错误 ${code} 保留作品并提示失败`, async () => {
     const { context } = content();
@@ -209,12 +181,12 @@ test('内容脚本同步拦截重复请求，并将提取失败交给后台保�
 test('未接入平台不会留下运行状态', async () => {
   const bg = background();
   const page = content((msg) => bg.send(msg));
-  assert.equal((await page.send({ type: 'extract', platform: '小红书' })).ok, false);
+  assert.equal((await page.send({ type: 'extract', platform: '未接入平台' })).ok, false);
   assert.equal(bg.local.state.running, undefined);
 });
 
 test('恢复运行中的任务时锁定选择器，切换事件不能重新启用提取', async () => {
-  const ui = popup(storage({ running: true, runningAt: Date.now() }));
+  const ui = popup(storage({ running: true, runningPlatform: '抖音', runningAt: Date.now() }));
   await tick();
   assert.equal(ui.elements.extract.disabled, true);
   assert.equal(ui.elements.platform.disabled, true);
@@ -227,7 +199,7 @@ test('恢复运行中的任务时锁定选择器，切换事件不能重新启�
 });
 
 test('重新打开的弹窗接到失败广播后退出提取中，显示持久化错误', async () => {
-  const local = storage({ running: true, runningAt: Date.now(), lastResult: sample });
+  const local = storage({ running: true, runningPlatform: '抖音', runningAt: Date.now(), lastResult: sample });
   const ui = popup(local);
   await tick();
   await local.set({ running: false, lastError: { platform: '抖音', period: 'week', message: '登录已失效', at: Date.now() } });
@@ -247,7 +219,7 @@ test('重新打开的弹窗接到失败广播后退出提取中，显示持久�
 });
 
 test('恢复运行中的弹窗收到成功广播后可下载结果', async () => {
-  const local = storage({ running: true, runningAt: Date.now() });
+  const local = storage({ running: true, runningPlatform: '抖音', runningAt: Date.now() });
   const ui = popup(local);
   await tick();
   await local.set({ running: false, lastResult: sample, lastResultAtMap: { '抖音': Date.now() } });
@@ -323,4 +295,50 @@ test('空作品结果不启用明细和封面下载，有封面时恢复封面�
   ui.event({ type: 'extractDone' });
   await tick();
   assert.equal(ui.elements.zipCover.disabled, false);
+});
+
+test('取消的平台及其临时样本请求均被拒绝，不修改任务状态', async () => {
+  const bg = background(storage({ lastResult: sample }));
+  const page = content((msg) => bg.send(msg));
+  for (const period of ['month', 'week', 'sample-video', 'sample-month-202609']) {
+    assert.equal((await bg.send({ type: 'beginExtraction', platform: '小红书', period })).ok, false);
+    assert.equal((await page.send({ type: 'extract', platform: '小红书', period })).ok, false);
+  }
+  assert.equal(bg.local.state.running, undefined);
+  assert.deepEqual(bg.local.state.lastResult, sample);
+  assert.equal(bg.events.length, 0);
+});
+
+test('取消的平台遗留任务不能阻塞新任务，晚到回包不能覆盖结果', async () => {
+  const bg = background(storage({ running: true, runningPlatform: '小红书', runningPeriod: 'sample-video', runningAt: Date.now(), runningId: 'removed-task', runningTabId: 1, lastResult: sample }));
+  const oldReply = { type: 'endExtraction', taskId: 'removed-task', data: { platform: '小红书', count: 99 } };
+  assert.equal((await bg.send(oldReply)).ok, false);
+  const started = await bg.send(begin, 2);
+  assert.equal(started.ok, true);
+  assert.equal((await bg.send(oldReply)).ok, false);
+  assert.equal(bg.local.state.runningId, started.taskId);
+  assert.deepEqual(bg.local.state.lastResult, sample);
+  assert.equal((await bg.send({ type: 'endExtraction', taskId: started.taskId, data: sample }, 2)).ok, true);
+});
+
+test('升级后忽略取消平台的旧任务、结果及错误，仍可选择并提取其他平台', async () => {
+  const ui = popup(storage({ running: true, runningAt: Date.now(), runningPlatform: '小红书', lastResult: { ...sample, platform: '小红书' }, lastError: { platform: '小红书', period: 'week', message: '旧错误', at: Date.now() } }));
+  await tick();
+  assert.equal(ui.elements.platform.value, '抖音');
+  assert.equal(ui.elements.platform.disabled, false);
+  assert.equal(ui.elements.extract.disabled, false);
+  assert.equal(ui.elements.result.textContent, '');
+  assert.equal(ui.elements.status.textContent, '');
+  for (const key of ['csv', 'postCsv', 'zipCover']) assert.equal(ui.elements[key].disabled, true);
+  assert.equal(vm.runInContext('urlMatches("https://creator.xiaohongshu.com/", "小红书")', ui.context), false);
+});
+
+test('取消平台的旧错误不影响恢复其他平台的成功结果', async () => {
+  const ui = popup(storage({ lastResult: { ...sample, platform: '哔哩哔哩' }, lastError: { platform: '小红书', period: 'week', message: '旧错误', at: Date.now() } }));
+  await tick();
+  assert.equal(ui.elements.platform.value, '哔哩哔哩');
+  assert.equal(ui.elements.csv.disabled, false);
+  assert.equal(ui.elements.postCsv.disabled, false);
+  assert.match(ui.elements.result.textContent, /哔哩哔哩/);
+  assert.doesNotMatch(ui.elements.status.textContent, /旧错误/);
 });

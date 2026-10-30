@@ -270,7 +270,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const platform = msg.platform || '抖音';
     const period = msg.period || 'month';
     if (!['抖音', '视频号', '哔哩哔哩'].includes(platform)) {
-      sendResponse({ ok: false, error: '小红书暂未接入' }); return;
+      sendResponse({ ok: false, error: '该平台暂未接入' }); return;
     }
     if (extractionActive) { sendResponse({ ok: false, busy: true, error: '已有提取任务正在运行，请等待完成' }); return; }
     extractionActive = true;

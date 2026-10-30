@@ -6,14 +6,13 @@ const FAIL_COOLDOWN_S = 5; // 提取失败后的短冷却：既提示可立即�
 const LOGIN_URL = {
   '视频号': 'https://channels.weixin.qq.com',
   '抖音': 'https://creator.douyin.com',
-  '小红书': 'https://creator.xiaohongshu.com',
   '哔哩哔哩': 'https://member.bilibili.com/platform/data-up/video/',
 };
 let latest = null;
 let extracting = false;
 let requestPending = false; // 本弹窗发起的请求由回包处理，重新打开的弹窗由广播恢复。
 let stateVersion = 0; // 使旧的异步恢复/冷却查询失效，避免覆盖新任务的界面。
-function isRunning(v) { return v && v.running && v.runningAt && Date.now() - v.runningAt < RUNNING_STALE_MS; }
+function isRunning(v) { return v && Object.hasOwn(LOGIN_URL, v.runningPlatform) && v.running && v.runningAt && Date.now() - v.runningAt < RUNNING_STALE_MS; }
 function setRunning(value) {
   extracting = value;
   $('platform').disabled = value; $('period').disabled = value;
@@ -22,17 +21,17 @@ function setRunning(value) {
 function restore() {
   if (requestPending) return;
   const version = ++stateVersion;
-  chrome.storage.local.get(['running', 'runningAt', 'lastResult', 'lastError']).then((v) => {
+  chrome.storage.local.get(['running', 'runningAt', 'runningPlatform', 'lastResult', 'lastError']).then((v) => {
     if (requestPending || version !== stateVersion) return;
     setRunning(!!isRunning(v));
     if (extracting) return;
-    if (v && v.lastError) {
-      latest = v.lastResult || null;
+    latest = v && v.lastResult && Object.hasOwn(LOGIN_URL, v.lastResult.platform) ? v.lastResult : null;
+    if (v && v.lastError && Object.hasOwn(LOGIN_URL, v.lastError.platform)) {
       $('platform').value = v.lastError.platform;
       $('period').value = v.lastError.period || 'month';
       setBtns(false); $('result').textContent = ''; refreshBtnState(); return;
     }
-    if (v && v.lastResult) { latest = v.lastResult; syncSelectsToLatest(); applySelectionState(); }
+    if (latest) { syncSelectsToLatest(); applySelectionState(); }
     else { setBtns(false); $('result').textContent = ''; setStatus(''); refreshBtnState(); }
   }).catch((e) => { if (version === stateVersion && !requestPending) setStatus('无法恢复提取状态：' + e.message, true); });
 }
@@ -85,7 +84,7 @@ function setExtractBtn(enable) { $('extract').disabled = !enable || extracting |
 // 把平台/周期下拉框同步成当前数据（latest）对应的值，便于辨认该数据属于哪个平台/周期。
 function syncSelectsToLatest() {
   if (!latest) return;
-  if ($('platform') && ['视频号', '抖音', '哔哩哔哩'].includes(latest.platform)) $('platform').value = latest.platform;
+  if ($('platform') && Object.hasOwn(LOGIN_URL, latest.platform)) $('platform').value = latest.platform;
   if ($('period')) $('period').value = latest.scopeLabel === '周度' ? 'week' : 'month';
 }
 // 结果摘要与提示都跟随「当前所选平台+周期」：与已加载数据一致则显示并启用下载，不一致则清空（避免切换后仍显示旧平台/周期的数据与提示）。
@@ -170,7 +169,7 @@ function refreshBtnState(doneMsg) {
   if (extracting || requestPending) return;
   const version = ++stateVersion;
   const platform = $('platform').value;
-  chrome.storage.local.get(['running', 'runningAt', 'lastResultAtMap', 'lastError']).then((v) => {
+  chrome.storage.local.get(['running', 'runningAt', 'runningPlatform', 'lastResultAtMap', 'lastError']).then((v) => {
     if (version !== stateVersion || extracting || requestPending || platform !== $('platform').value) return;
     if (isRunning(v)) { setRunning(true); return; }
     const map = (v && v.lastResultAtMap) || {};
